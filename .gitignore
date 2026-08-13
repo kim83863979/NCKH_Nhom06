@@ -15,12 +15,6 @@ __pycache__/
 *.userossc
 *.sln.docstates
 
-# File video nặng trong folder data (giữ lại ảnh vệ tinh)
-data/*.mp4
-data/*.avi
-data/*.mkv
-data/*.mov
-
 # Trọng số mô hình AI nặng (Tránh đẩy file weights lớn lên Git)
 weights/*.pt
 weights/*.onnx

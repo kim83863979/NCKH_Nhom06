@@ -1,0 +1,26 @@
+# Python & Môi trường ảo
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Visual Studio & VS Code
+.vs/
+.vscode/
+*.suo
+*.user
+*.userossc
+*.sln.docstates
+
+# Trọng số mô hình AI nặng (Tránh đẩy file weights lớn lên Git)
+weights/*.pt
+weights/*.onnx
+weights/*.engine
+*.weights
+
+# System files
+.DS_Store
+Thumbs.db

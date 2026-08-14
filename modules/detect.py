@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict, deque
 import math
+import json
+import os
+from datetime import datetime
 import cv2
 import numpy as np
 
@@ -236,6 +239,7 @@ class StandardYoloAutoOBB:
 def run_auto_obb_demo(
     video_source: Any = "/kaggle/input/datasets/holthin/testvideo/32499-392669624_medium.mp4",
     output_video_path: str = "/kaggle/working/output_auto_obb.mp4",
+    log_output_path: Optional[str] = "/kaggle/working/detection_log.json",
     max_frames: Optional[int] = None
 ):
     detector = StandardYoloAutoOBB()
@@ -286,6 +290,27 @@ def run_auto_obb_demo(
         cap.release()
         writer.release()
         print(f"✅ Hoàn tất! Video lưu tại: {output_video_path}")
+
+    # ---- GHI LOG FILE ----
+    if log_output_path:
+        log_data = {
+            "metadata": {
+                "created_at": datetime.now().isoformat(),
+                "video_source": str(video_source),
+                "model": MODEL_PATH,
+                "conf_threshold": CONF_THRESHOLD,
+                "total_frames": frame_index,
+                "total_detections": sum(len(f["detections"]) for f in all_results_for_tv3),
+            },
+            "frames": all_results_for_tv3
+        }
+
+        os.makedirs(os.path.dirname(log_output_path) or ".", exist_ok=True)
+        with open(log_output_path, "w", encoding="utf-8") as f:
+            json.dump(log_data, f, ensure_ascii=False, indent=2)
+
+        file_size_mb = os.path.getsize(log_output_path) / (1024 * 1024)
+        print(f"📄 Log đã lưu: {log_output_path} ({file_size_mb:.1f} MB)")
 
     return all_results_for_tv3
 

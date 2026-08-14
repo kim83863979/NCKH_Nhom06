@@ -1,11 +1,7 @@
 """
 Giải pháp Auto-OBB từ Model YOLO 2D Thường (Standard Axis-Aligned Bounding Box).
 --------------------------------------------------------------------------------
-Tính năng: Tự động tính & tự điều chỉnh góc xoay (Auto Angle Adjustment) dựa trên
-kết hợp Motion Vector + Computer Vision Image Analysis (MinAreaRect).
-
-Input : Frame thô từ TV1 (BGR numpy array).
-Output: Dữ liệu OBB 4 điểm xoay + Class xe -> Giao TV3.
+Tính năng: Tự động tính & tự điều chỉnh góc xoay + Angle Lock chống xoay khi đứng yên.
 """
 
 from dataclasses import dataclass, field
@@ -27,22 +23,18 @@ except ImportError as e:
 # ============================================================================
 # CẤU HÌNH MACRO
 # ============================================================================
-# Dùng model YOLO chuẩn (không phải -obb)
-MODEL_PATH = "yolo11s.pt"  # hoặc "yolo11s.pt" nếu xài Ultralytics mới
-
-# 2. Hạ ngưỡng Confidence xuống 0.25 để giữ lại các detection xe máy
+MODEL_PATH = "yolo11s.pt"  
 CONF_THRESHOLD = 0.25
-
-# 3. Thêm Class ID 1 (bicycle) vì YOLO rất hay bị nhầm xe máy thành xe đạp
-VEHICLE_CLASS_IDS = [1, 2, 3, 5, 7]  # 1:
+IMAGE_SIZE = 1024  # Tăng resolution để bắt xe máy nhỏ xa
+VEHICLE_CLASS_IDS = [1, 2, 3, 5, 7]  # 1: bicycle, 2: car, 3: motorcycle, 5: bus, 7: truck
 
 
 # ============================================================================
-# DỮ LIỆU BÀN GIAO CHO TV3 (GIỮ NGUYÊN INTERFACE)
+# DỮ LIỆU BÀN GIAO CHO TV3
 # ============================================================================
 @dataclass
 class OBBDetection:
-    polygon: List[List[float]]  # 4 điểm [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+    polygon: List[List[float]]
     class_id: int
     class_name: str
     confidence: float
@@ -73,18 +65,17 @@ class FrameOBBResult:
 
 
 # ============================================================================
-# BỘ TỰ ĐỘNG ĐIỀU CHỈNH GÓC (AUTO-ANGLE ESTIMATOR)
+# BỘ TỰ ĐỘNG ĐIỀU CHỈNH & KHÓA GÓC XOAY (STABLE AUTO-ANGLE ADJUSTER)
 # ============================================================================
 class AutoAngleAdjuster:
     """
-    Tự động tính toán & làm mượt góc xoay cho từng xe:
-    - Nếu xe di chuyển: Dùng Vector hướng đi (Độ chính xác cao nhất).
-    - Nếu xe đứng yên: Crop ảnh xe -> Phân tích cạnh (Canny + minAreaRect) tìm dáng xe.
-    - Làm mượt góc qua thời gian bằng bộ lọc EMA (tránh giật khung).
+    Tự động tính toán, làm mượt & ĐÓNG BẰNG góc xoay khi xe đứng yên:
+    - Di chuyển (> 12px): Cập nhật góc theo Motion Vector + EMA Smoothing.
+    - Đứng yên (<= 12px): Khóa cứng góc (Angle Lock), không recalculate.
     """
-    def __init__(self, history_len: int = 6, min_move_px: float = 3.5, smoothing: float = 0.25):
+    def __init__(self, history_len: int = 8, min_move_px: float = 12.0, smoothing: float = 0.20):
         self.history_len = history_len
-        self.min_move_px = min_move_px
+        self.min_move_px = min_move_px  # Tăng ngưỡng để lọc hoàn toàn nhiễu BBox jitter
         self.smoothing = smoothing
         
         self.track_history = defaultdict(lambda: deque(maxlen=history_len))
@@ -95,110 +86,90 @@ class AutoAngleAdjuster:
         """Xử lý góc xoay qua mốc 180/-180 độ."""
         return (to_deg - from_deg + 180.0) % 360.0 - 180.0
 
-    def _estimate_angle_from_image_crop(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    def _estimate_initial_stationary_angle(self, w: float, h: float) -> float:
         """
-        Fallback khi xe đứng yên: Crop vùng ảnh xe -> dùng Thuật toán xử lý ảnh 
-        để tự ước lượng trục dài của thân xe.
+        Khởi tạo góc ban đầu cho xe vừa xuất hiện nhưng ĐÃ ĐỨNG YÊN:
+        Dựa vào tỷ lệ W/H của BBox thay vì soi Canny bị nhiễu.
         """
-        x1, y1, x2, y2 = bbox
-        h_img, w_img = frame.shape[:2]
-        
-        # Clip tọa độ hợp lệ
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w_img, x2), min(h_img, y2)
-        
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0 or (x2 - x1) < 10 or (y2 - y1) < 10:
-            return 0.0
+        return 0.0 if w >= h else 90.0
 
-        # Chuyển xám & lọc cạnh Canny
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        
-        # Tìm Contour lớn nhất đại diện cho xe
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_contour) > 20:
-                rect = cv2.minAreaRect(largest_contour)
-                angle = rect[2]
-                # Chuẩn hóa góc rect về khoảng [-90, 90]
-                if rect[1][0] < rect[1][1]:
-                    angle += 90.0
-                return angle
-        return 0.0
-
-    def get_auto_angle(self, track_id: int, cx: float, cy: float, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+    def get_auto_angle(self, track_id: int, cx: float, cy: float, w: float, h: float) -> float:
         hist = self.track_history[track_id]
         hist.append((cx, cy))
-        
-        prev_angle = self.smoothed_angles.get(track_id, 0.0)
-        target_angle = prev_angle
 
-        # 1. Thử tính góc từ chuyển động (Motion Vector)
-        if len(hist) >= 2:
+        # 1. Nếu xe mới xuất hiện chưa từng có góc -> Khởi tạo góc tĩnh ban đầu
+        if track_id not in self.smoothed_angles:
+            initial_angle = self._estimate_initial_stationary_angle(w, h)
+            self.smoothed_angles[track_id] = initial_angle
+
+        prev_angle = self.smoothed_angles[track_id]
+
+        # 2. Kiểm tra khoảng cách di chuyển trong chuỗi history_len frame
+        if len(hist) >= 3:
             dx = hist[-1][0] - hist[0][0]
             dy = hist[-1][1] - hist[0][1]
             dist = math.hypot(dx, dy)
-            
-            if dist >= self.min_move_px:
-                target_angle = math.degrees(math.atan2(dy, dx))
-            else:
-                # 2. Xe đứng yên -> Nếu chưa từng có góc thì dùng Image Crop Analysis
-                if track_id not in self.smoothed_angles:
-                    target_angle = self._estimate_angle_from_image_crop(frame, bbox)
 
-        # 3. Làm mượt góc (EMA Filter)
-        delta = self._shortest_angle_diff(prev_angle, target_angle)
-        new_angle = prev_angle + self.smoothing * delta
-        
-        self.smoothed_angles[track_id] = new_angle
-        return new_angle
+            if dist >= self.min_move_px:
+                # XE ĐANG DI CHUYỂN RÕ RÀNG -> Cập nhật góc mới từ Motion Vector
+                target_angle = math.degrees(math.atan2(dy, dx))
+                
+                # Làm mượt góc qua thời gian bằng bộ lọc EMA
+                delta = self._shortest_angle_diff(prev_angle, target_angle)
+                new_angle = prev_angle + self.smoothing * delta
+                
+                self.smoothed_angles[track_id] = new_angle
+                return new_angle
+
+        # 3. XE ĐỨNG YÊN (hoặc chưa đủ history) -> KHÓA GÓC HOÀN TOÀN (ANGLE LOCK)
+        return prev_angle
 
 
 # ============================================================================
 # MAIN DETECTOR CLASS
 # ============================================================================
 class StandardYoloAutoOBB:
-    def __init__(self, model_path: str = MODEL_PATH, conf_threshold: float = CONF_THRESHOLD):
+    def __init__(self, model_path: str = MODEL_PATH, conf_threshold: float = CONF_THRESHOLD, imgsz: int = IMAGE_SIZE):
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
+        self.imgsz = imgsz
         self.angle_adjuster = AutoAngleAdjuster()
 
     def process_frame(self, frame: np.ndarray, frame_index: int = 0) -> FrameOBBResult:
-        # Bật tracking tự động của YOLO
-        results = self.model.track(source=frame, conf=self.conf_threshold, persist=True, verbose=False)
+        results = self.model.track(
+            source=frame, 
+            conf=self.conf_threshold, 
+            imgsz=self.imgsz, 
+            persist=True, 
+            verbose=False
+        )
         detections: List[OBBDetection] = []
 
         for r in results:
             if r.boxes is None:
                 continue
 
-            # Lấy thông tin BBox 2D chuẩn
             boxes_xywh = r.boxes.xywh.cpu().numpy()
-            boxes_xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
             class_ids = r.boxes.cls.cpu().numpy().astype(int)
             confs = r.boxes.conf.cpu().numpy()
             
-            # Track ID (nếu chưa có track_id thì fallback gán tạm ID=-1)
             track_ids = r.boxes.id.cpu().numpy().astype(int) if r.boxes.id is not None else [-1] * len(class_ids)
             names = r.names
 
-            for (cx, cy, w, h), bbox_xyxy, tid, cls_id, conf in zip(boxes_xywh, boxes_xyxy, track_ids, class_ids, confs):
-                # Chỉ lọc phương tiện giao thông
+            for (cx, cy, w, h), tid, cls_id, conf in zip(boxes_xywh, track_ids, class_ids, confs):
                 if cls_id not in VEHICLE_CLASS_IDS:
                     continue
 
                 class_name = names.get(int(cls_id), str(cls_id))
 
-                # TỰ ĐỘNG BẮT GÓC XOAY
+                # LẤY GÓC TỰ ĐỘNG (ĐÃ CÓ CƠ CHẾ ANGLE LOCK CHỐNG XOAY CHI ĐỨNG YÊN)
                 angle = self.angle_adjuster.get_auto_angle(
                     track_id=int(tid),
                     cx=float(cx), cy=float(cy),
-                    frame=frame, bbox=tuple(bbox_xyxy)
+                    w=float(w), h=float(h)
                 )
 
-                # DỰNG 4 ĐIỂM XOAY POLYGON TỪ GÓC MỚI TÍNH
+                # DỰNG POLYGON 4 ĐIỂM
                 polygon = self._build_obb_polygon(cx, cy, w, h, angle)
 
                 detections.append(OBBDetection(
@@ -237,7 +208,7 @@ class StandardYoloAutoOBB:
 # PIPELINE XỬ LÝ VIDEO
 # ============================================================================
 def run_auto_obb_demo(
-    video_source: Any = "/kaggle/input/datasets/holthin/testvideo/32499-392669624_medium.mp4",
+    video_source: Any = "/kaggle/input/datasets/holthin/stream-video/2026-08-14 16-53-48.mp4",
     output_video_path: str = "/kaggle/working/output_auto_obb.mp4",
     log_output_path: Optional[str] = "/kaggle/working/detection_log.json",
     max_frames: Optional[int] = None
@@ -255,7 +226,7 @@ def run_auto_obb_demo(
     all_results_for_tv3 = []
     frame_index = 0
 
-    print("🚀 Đang chạy Auto-Adjustable OBB với Model YOLO Thường...")
+    print("🚀 Đang chạy Auto-Adjustable OBB (Đã bật Angle Lock chống xoay khi xe đứng yên)...")
 
     try:
         while cap.isOpened():
@@ -263,14 +234,12 @@ def run_auto_obb_demo(
             if not ok or (max_frames is not None and frame_index >= max_frames):
                 break
 
-            # 1. Chạy Detector
             res = detector.process_frame(frame, frame_index=frame_index)
             
-            # 2. Dữ liệu giao TV3
             output_data = res.to_dict()
             all_results_for_tv3.append(output_data)
 
-            # 3. Vẽ kết quả lên video
+            # Vẽ kết quả
             for det in res.detections:
                 pts = np.array(det.polygon, dtype=np.int32)
                 cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
@@ -291,7 +260,7 @@ def run_auto_obb_demo(
         writer.release()
         print(f"✅ Hoàn tất! Video lưu tại: {output_video_path}")
 
-    # ---- GHI LOG FILE ----
+    # Ghi log JSON
     if log_output_path:
         log_data = {
             "metadata": {

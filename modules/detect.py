@@ -34,7 +34,7 @@ except ImportError as e:
 # ============================================================================
 # CẤU HÌNH MACRO
 # ============================================================================
-MODEL_PATH = "yolo11s.pt"
+MODEL_PATH = "yolo11n.pt"
 CONF_THRESHOLD = 0.25
 IMAGE_SIZE = 1024  # Tăng resolution để bắt xe máy nhỏ xa
 VEHICLE_CLASS_IDS = {1, 2, 3, 5, 7}  # set thay vì list -> lookup O(1)
@@ -83,67 +83,80 @@ class FrameOBBResult:
 # ============================================================================
 class AutoAngleAdjuster:
     """
-    Tự động tính toán, làm mượt & ĐÓNG BẰNG góc xoay khi xe đứng yên:
-    - Di chuyển (> 12px): Cập nhật góc theo Motion Vector + EMA Smoothing.
-    - Đứng yên (<= 12px): Khóa cứng góc (Angle Lock), không recalculate.
-    - Track không xuất hiện lâu -> bị dọn khỏi bộ nhớ (chống leak).
+    Tự động tính toán, làm mượt & ĐÓNG BẰNG góc xoay khi xe đứng yên.
+    Đã bổ sung: Lọc góc xe máy chính diện + Median filter + Hàm cleanup_stale_tracks.
     """
 
-    def __init__(self, history_len: int = 8, min_move_px: float = 12.0, smoothing: float = 0.20):
+    def __init__(self, history_len: int = 10, min_move_px: float = 12.0, smoothing: float = 0.15):
         self.history_len = history_len
         self.min_move_px = min_move_px
         self.smoothing = smoothing
 
         self.track_history = defaultdict(lambda: deque(maxlen=history_len))
+        self.raw_angle_history = defaultdict(lambda: deque(maxlen=5))  # Median filter chống nhảy góc
         self.smoothed_angles: Dict[int, float] = {}
-        # frame_index cuối cùng mỗi track_id được cập nhật -> dùng để dọn track chết
         self.last_seen_frame: Dict[int, int] = {}
 
     @staticmethod
     def _shortest_angle_diff(from_deg: float, to_deg: float) -> float:
-        """Xử lý góc xoay qua mốc 180/-180 độ."""
         return (to_deg - from_deg + 180.0) % 360.0 - 180.0
 
-    def _estimate_initial_stationary_angle(self, w: float, h: float) -> float:
-        """
-        Khởi tạo góc ban đầu cho xe vừa xuất hiện nhưng ĐÃ ĐỨNG YÊN:
-        Dựa vào tỷ lệ W/H của BBox thay vì soi Canny bị nhiễu.
-        Lưu ý: chỉ là ước lượng thô ban đầu, sẽ tự sửa khi xe di chuyển.
-        """
-        return 0.0 if w >= h else 90.0
-
-    def get_auto_angle(self, track_id: int, cx: float, cy: float, w: float, h: float, frame_index: int = 0) -> float:
+    def get_auto_angle(
+        self, track_id: int, cx: float, cy: float, w: float, h: float, class_id: int = -1, frame_index: int = 0
+    ) -> float:
         hist = self.track_history[track_id]
         hist.append((cx, cy))
         self.last_seen_frame[track_id] = frame_index
 
+        aspect_ratio = w / max(h, 1e-5)
+        # Xe máy (class_id 3 trong COCO) hoặc vật thể hẹp/cao
+        is_motorcycle = (class_id == 3) or (aspect_ratio < 0.50)
+
         if track_id not in self.smoothed_angles:
-            initial_angle = self._estimate_initial_stationary_angle(w, h)
+            initial_angle = 90.0 if aspect_ratio < 0.8 else 0.0
             self.smoothed_angles[track_id] = initial_angle
 
         prev_angle = self.smoothed_angles[track_id]
 
-        if len(hist) >= 3:
+        if len(hist) >= 4:
             dx = hist[-1][0] - hist[0][0]
             dy = hist[-1][1] - hist[0][1]
             dist = math.hypot(dx, dy)
 
-            if dist >= self.min_move_px:
-                target_angle = math.degrees(math.atan2(dy, dx))
-                delta = self._shortest_angle_diff(prev_angle, target_angle)
-                new_angle = prev_angle + self.smoothing * delta
+            effective_min_move = self.min_move_px * 1.5 if is_motorcycle else self.min_move_px
+
+            if dist >= effective_min_move:
+                abs_dx, abs_dy = abs(dx), abs(dy)
+
+                # 1. Snap góc nếu xe chạy chủ yếu theo hướng dọc (chính diện camera)
+                if abs_dy > 0 and (abs_dx / abs_dy) < 0.35:
+                    target_angle = 90.0 if dy > 0 else -90.0
+                # 2. Ngược lại tính theo Motion Vector bình thường
+                else:
+                    target_angle = math.degrees(math.atan2(dy, dx))
+
+                # 3. Median Filter loại bỏ góc nhiễu nhảy tức thời
+                self.raw_angle_history[track_id].append(target_angle)
+                filtered_target = float(np.median(self.raw_angle_history[track_id]))
+
+                # 4. EMA Smoothing
+                eff_smoothing = self.smoothing * 0.7 if is_motorcycle else self.smoothing
+                delta = self._shortest_angle_diff(prev_angle, filtered_target)
+                new_angle = prev_angle + eff_smoothing * delta
+
                 self.smoothed_angles[track_id] = new_angle
                 return new_angle
 
         return prev_angle
 
     def cleanup_stale_tracks(self, current_frame: int, stale_after: int = TRACK_STALE_AFTER_FRAMES) -> int:
-        """Xóa các track không xuất hiện quá `stale_after` frame -> chống memory leak."""
+        """Xóa các track không xuất hiện quá stale_after frame -> chống memory leak."""
         stale_ids = [
             tid for tid, last_frame in self.last_seen_frame.items() if current_frame - last_frame > stale_after
         ]
         for tid in stale_ids:
             self.track_history.pop(tid, None)
+            self.raw_angle_history.pop(tid, None)
             self.smoothed_angles.pop(tid, None)
             self.last_seen_frame.pop(tid, None)
         return len(stale_ids)
@@ -167,17 +180,23 @@ class StandardYoloAutoOBB:
         self.imgsz = imgsz
         self.device = device
         self.half = half
+
+        # Chuyển model sang half-precision (fp16) MỘT LẦN DUY NHẤT lúc khởi tạo,
+        # thay vì truyền half= vào track() mỗi frame (tham số đó đã bị deprecate
+        # trong ultralytics mới -> spam warning liên tục qua từng frame).
+        if self.half:
+            try:
+                self.model.model.half()
+            except Exception:
+                # Một số bản model/backend không hỗ trợ .half() trực tiếp -> bỏ qua,
+                # vẫn chạy fp32 bình thường, không crash.
+                self.half = False
+
         self.angle_adjuster = AutoAngleAdjuster()
 
     def process_frame(self, frame: np.ndarray, frame_index: int = 0) -> FrameOBBResult:
         results = self.model.track(
-            source=frame,
-            conf=self.conf_threshold,
-            imgsz=self.imgsz,
-            persist=True,
-            verbose=False,
-            device=self.device,
-            half=self.half,
+            source=frame, conf=self.conf_threshold, imgsz=self.imgsz, persist=True, verbose=False, device=self.device
         )
         detections: List[OBBDetection] = []
 
@@ -199,7 +218,13 @@ class StandardYoloAutoOBB:
                 class_name = names.get(int(cls_id), str(cls_id))
 
                 angle = self.angle_adjuster.get_auto_angle(
-                    track_id=int(tid), cx=float(cx), cy=float(cy), w=float(w), h=float(h), frame_index=frame_index
+                    track_id=int(tid),
+                    cx=float(cx),
+                    cy=float(cy),
+                    w=float(w),
+                    h=float(h),
+                    class_id=int(cls_id),  # Truyền class_id để xử lý riêng xe máy
+                    frame_index=frame_index,
                 )
 
                 polygon = self._build_obb_polygon(cx, cy, w, h, angle)
@@ -343,6 +368,14 @@ def run_auto_obb_demo(
         "video_path": output_video_path,
     }
 
+
+if __name__ == "__main__":
+    summary = run_auto_obb_demo(
+        video_source="/kaggle/input/datasets/holthin/stream-video/2026-08-14 16-53-48.mp4",
+        output_video_path="/kaggle/working/output_auto_obb.mp4",
+        max_frames=None,
+    )
+    print(summary)
 
 if __name__ == "__main__":
     summary = run_auto_obb_demo(
